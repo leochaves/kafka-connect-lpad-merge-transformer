@@ -19,9 +19,11 @@ import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transformation<R> {
 
@@ -70,7 +72,7 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
 
         String targetTypeStr = config.getString(TARGET_TYPE_CONFIG).toUpperCase();
         if ("DECIMAL".equals(targetTypeStr)) {
-            this.targetType = Schema.Type.BYTES;
+            this.targetType = Schema.Type.STRING;
             this.isDecimalType = true;
         } else {
             this.targetType = Schema.Type.valueOf(targetTypeStr);
@@ -102,7 +104,6 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
 
     @Override
     public R apply(R record) {
-        // If not moving to key, and it's a tombstone, pass it through.
         if (!mergedToKey && record.value() == null) {
             return record;
         }
@@ -110,35 +111,57 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
         String mergedString = getMergedString(record);
         Object finalValue = convertToTargetType(mergedString);
 
-        // If we need to update the key, we do it for all records (including tombstones)
         if (mergedToKey) {
-            Schema newKeySchema = Schema.STRING_SCHEMA; // The new key is always a string after merge.
-            Object newKeyValue = mergedString;
+            // 1. Define the new key schema: a struct with a single, optional field.
+            Schema newKeySchema = SchemaBuilder.struct()
+                .name("com.tjmg.kafka.connect.lpadmerge.MergedKey")
+                .field(mergedField, SchemaBuilder.string().optional().defaultValue(null).build())
+                .build();
 
-            // For tombstones, the value and schema are null
-            if (record.value() == null) {
-                return record.newRecord(record.topic(), record.kafkaPartition(), newKeySchema, newKeyValue, null, null, record.timestamp());
+            // 2. Create the new key struct
+            Struct newKey = new Struct(newKeySchema);
+            newKey.put(mergedField, mergedString);
+
+            // For schemaless, the key is a map
+            Map<String, String> newKeyMap = Collections.singletonMap(mergedField, mergedString);
+
+            Object finalKey = record.keySchema() == null ? newKeyMap : newKey;
+            Schema finalKeySchema = record.keySchema() == null ? null : newKeySchema;
+
+            // 3. Update the Value (add the merged field to the value as well)
+            if (record.value() == null) { // Tombstone
+                return record.newRecord(record.topic(), record.kafkaPartition(), finalKeySchema, finalKey, null, null, record.timestamp());
             }
 
-            // For regular records, update the value and the key
-            if (record.valueSchema() == null) {
-                Map<String, Object> value = Requirements.requireMap(record.value(), "lpad merge");
-                Map<String, Object> updatedValue = new HashMap<>(value);
-                updatedValue.put(mergedField, finalValue);
-                return record.newRecord(record.topic(), record.kafkaPartition(), newKeySchema, newKeyValue, null, updatedValue, record.timestamp());
-            } else {
-                Struct value = Requirements.requireStruct(record.value(), "lpad merge");
-                Schema updatedSchema = getUpdatedSchema(value.schema());
-                Struct updatedValue = new Struct(updatedSchema);
-                for (Field field : record.valueSchema().fields()) {
-                    updatedValue.put(field.name(), value.get(field.name()));
+            Object updatedValue;
+            Schema updatedValueSchema;
+
+            if (record.valueSchema() == null) { // Schemaless value
+                updatedValueSchema = null;
+                Map<String, Object> originalValue = Requirements.requireMap(record.value(), "lpad merge value schemaless");
+                Map<String, Object> newValueMap = new HashMap<>(originalValue);
+                newValueMap.put(mergedField, finalValue);
+                updatedValue = newValueMap;
+            } else { // Value with schema
+                Struct originalValue = Requirements.requireStruct(record.value(), "lpad merge value");
+                updatedValueSchema = schemaUpdateCache.get(originalValue.schema());
+                if (updatedValueSchema == null) {
+                    updatedValueSchema = makeUpdatedSchema(originalValue.schema());
+                    schemaUpdateCache.put(originalValue.schema(), updatedValueSchema);
                 }
-                updatedValue.put(mergedField, finalValue);
-                return record.newRecord(record.topic(), record.kafkaPartition(), newKeySchema, newKeyValue, updatedSchema, updatedValue, record.timestamp());
+                Struct newValueStruct = new Struct(updatedValueSchema);
+                for (Field field : originalValue.schema().fields()) {
+                    newValueStruct.put(field.name(), originalValue.get(field.name()));
+                }
+                newValueStruct.put(mergedField, finalValue);
+                updatedValue = newValueStruct;
             }
+
+            // 4. Return the new record
+            return record.newRecord(record.topic(), record.kafkaPartition(), finalKeySchema, finalKey, updatedValueSchema, updatedValue, record.timestamp());
         }
 
-        // Original logic: only update the value, do not change the key.
+        // Logic for when merged.to.key is false
         if (record.valueSchema() == null) {
             return applySchemaless(record, finalValue);
         } else {
@@ -158,7 +181,9 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
         Schema updatedSchema = getUpdatedSchema(value.schema());
         Struct updatedValue = new Struct(updatedSchema);
         for (Field field : record.valueSchema().fields()) {
-            updatedValue.put(field.name(), value.get(field.name()));
+            Object fieldValue = value.get(field.name());
+            log.debug("Copying field: {} with schema: {} and value: {}", field.name(), field.schema(), fieldValue);
+            updatedValue.put(field.name(), fieldValue);
         }
         updatedValue.put(mergedField, finalValue);
         return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());
@@ -180,8 +205,10 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
 
             String stringValue = (fieldValue != null) ? String.valueOf(fieldValue) : "";
             int lpadLength = lpadLengths.getOrDefault(fieldName, 0);
+            log.debug("Field: {}, Original StringValue: {}, LPAD Length: {}", fieldName, stringValue, lpadLength);
             if (lpadLength > 0) {
                 stringValue = String.format("%" + lpadLength + "s", stringValue).replace(' ', '0');
+                log.debug("Field: {}, LPAD Result: {}", fieldName, stringValue);
             }
             lpadValues.add(stringValue);
         }
@@ -205,7 +232,7 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
     }
 
     private Object getNestedFieldValue(Object source, String fieldName) {
-        String[] path = fieldName.split("\\.");
+        String[] path = Pattern.compile("\\.").split(fieldName);
         Object current = source;
         for (String part : path) {
             if (current == null) {
@@ -236,7 +263,7 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
                 if (decimalScale != null) {
                     decimalValue = decimalValue.setScale(decimalScale, BigDecimal.ROUND_HALF_UP);
                 }
-                return decimalValue;
+                return decimalValue.toPlainString();
             }
 
             switch (targetType) {
@@ -264,13 +291,13 @@ public class LpadMergeTransformer<R extends ConnectRecord<R>> implements Transfo
             builder.field(field.name(), field.schema());
         }
 
-        Schema newSchema;
+        Schema newFieldSchema;
         if (isDecimalType) {
-            newSchema = org.apache.kafka.connect.data.Decimal.builder(decimalScale).build();
+            newFieldSchema = SchemaBuilder.string().optional().defaultValue(null).build();
         } else {
-            newSchema = SchemaBuilder.type(targetType).build();
+            newFieldSchema = SchemaBuilder.type(targetType).optional().defaultValue(null).build();
         }
-        builder.field(mergedField, newSchema);
+        builder.field(mergedField, newFieldSchema);
 
         return builder.build();
     }

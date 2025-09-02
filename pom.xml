@@ -27,6 +27,12 @@
             <scope>test</scope>
             <version>4.12</version>
         </dependency>
+    <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.32</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -38,6 +44,16 @@
                 <configuration>
                     <source>${maven.compiler.source}</source>
                     <target>${maven.compiler.target}</target>
+                </configuration>
+            </plugin>
+        <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <systemPropertyVariables>
+                        <org.slf4j.simplelogger.defaultLogLevel>debug</org.slf4j.simplelogger.defaultLogLevel>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
         </plugins>
